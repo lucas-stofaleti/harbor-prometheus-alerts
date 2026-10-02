@@ -1,0 +1,254 @@
+# GENERATED FILE - do not edit by hand.
+# Source: rules/harbor-alerts.yaml  (regenerate with `make prometheusrule`)
+# NOTE: annotations contain Go templates ({{ ... }}). If you embed this file
+# in a Helm chart, escape them, e.g. {{ "{{ $labels.job }}" }}.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: harbor-alerts
+  labels:
+    app.kubernetes.io/name: harbor-alerts
+spec:
+  groups:
+  - name: harbor.availability
+    rules:
+    - alert: HarborMetricsMissing
+      expr: absent(harbor_health)
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Harbor health metrics are missing
+        description: No harbor_health series has been received for 5 minutes. Either the Harbor exporter is down / not scraped, or it cannot reach Harbor core. Check the exporter and core pods/containers and the scrape config.
+    - alert: HarborUnhealthy
+      expr: harbor_health == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Harbor reports itself as unhealthy
+        description: The Harbor health API has been reporting a non-healthy status for 5 minutes on {{ $labels.instance }}. Look at harbor_up{component=...} to find the failing component.
+    - alert: HarborComponentDown
+      expr: harbor_up{component=~"core|database|redis|registry"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Harbor component {{ $labels.component }} is down
+        description: Harbor component {{ $labels.component }} has been reported as not healthy for 5 minutes. Image pushes and pulls are likely impacted.
+    - alert: HarborAuxiliaryComponentDown
+      expr: harbor_up{component=~"jobservice|portal|registryctl|trivy"} == 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor component {{ $labels.component }} is down
+        description: Harbor component {{ $labels.component }} has been unhealthy for 10 minutes. Core registry functionality still works, but the features that depend on this component are unavailable.
+    - alert: HarborScrapeTargetDown
+      expr: up{job=~".*harbor.*"} == 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor scrape target {{ $labels.instance }} is down
+        description: Prometheus cannot scrape {{ $labels.job }} / {{ $labels.instance }} for 5 minutes. Check that metrics are enabled in harbor.yml (or metrics.enabled in the Helm chart) and that the port/path is reachable.
+  - name: harbor.core
+    rules:
+    - alert: HarborCoreHighErrorRate
+      expr: |
+        (
+            sum by (job) (rate(harbor_core_http_request_total{code=~"5.."}[5m]))
+          /
+            sum by (job) (rate(harbor_core_http_request_total[5m]))
+        ) > 0.05
+        and
+        sum by (job) (rate(harbor_core_http_request_total[5m])) > 0.1
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: Harbor core is returning many 5xx responses
+        description: '{{ $value | humanizePercentage }} of Harbor core API requests ({{ $labels.job }}) have failed with a 5xx in the last 5 minutes. Check core logs and database/redis connectivity.'
+    - alert: HarborCoreSlowRequests
+      expr: |
+        (
+            rate(harbor_core_http_request_duration_seconds_sum[5m])
+          /
+            rate(harbor_core_http_request_duration_seconds_count[5m])
+        ) > 5
+        and
+        rate(harbor_core_http_request_duration_seconds_count[5m]) > 0.1
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor core operation {{ $labels.operation }} is slow
+        description: '{{ $labels.method }} {{ $labels.operation }} on {{ $labels.instance }} averages {{ $value | humanizeDuration }} per request over the last 5 minutes. Usually a slow database or an overloaded core.'
+    - alert: HarborCoreInflightRequestsHigh
+      expr: sum by (job) (harbor_core_http_inflight_requests) > 100
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor core has a high number of in-flight requests
+        description: '{{ $labels.job }} has had more than 100 concurrent requests for 10 minutes (now {{ $value }}). Core may be saturated or stuck on a dependency; consider scaling core replicas.'
+  - name: harbor.registry
+    rules:
+    - alert: HarborRegistryHighErrorRate
+      expr: |
+        (
+            sum by (job) (rate(registry_http_requests_total{code=~"5.."}[5m]))
+          /
+            sum by (job) (rate(registry_http_requests_total[5m]))
+        ) > 0.05
+        and
+        sum by (job) (rate(registry_http_requests_total[5m])) > 0.1
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: Harbor registry is returning many 5xx responses
+        description: '{{ $value | humanizePercentage }} of registry requests ({{ $labels.job }}) failed with a 5xx in the last 5 minutes. Pushes and pulls are impacted. Check registry logs and the storage backend (S3/GCS/Azure/filesystem).'
+    - alert: HarborRegistrySlowRequests
+      expr: |
+        histogram_quantile(0.95,
+          sum by (job, handler, le) (
+            rate(registry_http_request_duration_seconds_bucket{handler!~"blob.*"}[5m])
+          )
+        ) > 5
+        and on (job, handler)
+        sum by (job, handler) (
+          rate(registry_http_request_duration_seconds_count{handler!~"blob.*"}[5m])
+        ) > 0.1
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor registry handler {{ $labels.handler }} is slow
+        description: The 95th percentile latency of the registry "{{ $labels.handler }}" handler is {{ $value | humanizeDuration }} over the last 5 minutes.
+    - alert: HarborRegistryStorageSlow
+      expr: |
+        histogram_quantile(0.95,
+          sum by (job, driver, action, le) (
+            rate(registry_storage_action_seconds_bucket[5m])
+          )
+        ) > 10
+        and on (job, driver, action)
+        sum by (job, driver, action) (
+          rate(registry_storage_action_seconds_count[5m])
+        ) > 0.05
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Registry storage action {{ $labels.action }} is slow
+        description: The 95th percentile duration of the "{{ $labels.action }}" action on the {{ $labels.driver }} storage driver is {{ $value | humanizeDuration }}. Check the storage backend health, network path and throttling.
+  - name: harbor.jobservice
+    rules:
+    - alert: HarborJobQueueLatencyHigh
+      expr: harbor_task_queue_latency > 600
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor job queue {{ $labels.type }} is not draining
+        description: The oldest queued {{ $labels.type }} job has been waiting {{ $value | humanizeDuration }}. Check that jobservice is running and has free workers.
+    - alert: HarborJobQueueBacklog
+      expr: harbor_task_queue_size > 1000
+      for: 30m
+      labels:
+        severity: info
+      annotations:
+        summary: Harbor job queue {{ $labels.type }} has a large backlog
+        description: '{{ $value }} {{ $labels.type }} jobs have been waiting in the queue for 30 minutes.'
+    - alert: HarborJobsFailing
+      expr: |
+        (
+            sum by (job, type) (increase(harbor_jobservice_task_total{status="fail"}[1h]))
+          /
+            sum by (job, type) (increase(harbor_jobservice_task_total{status=~"success|fail"}[1h]))
+        ) > 0.25
+        and
+        sum by (job, type) (increase(harbor_jobservice_task_total{status=~"success|fail"}[1h])) >= 5
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor {{ $labels.type }} jobs are failing
+        description: '{{ $value | humanizePercentage }} of {{ $labels.type }} jobs failed in the last hour. Inspect the failed executions in the Harbor UI and the jobservice logs.'
+    - alert: HarborGarbageCollectionFailed
+      expr: |
+        (
+          increase(harbor_jobservice_task_total{type="GARBAGE_COLLECTION", status="fail"}[1h]) > 0
+        )
+        or
+        (
+          harbor_jobservice_task_total{type="GARBAGE_COLLECTION", status="fail"}
+          unless
+          harbor_jobservice_task_total{type="GARBAGE_COLLECTION", status="fail"} offset 1h
+        )
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor garbage collection failed
+        description: At least one garbage collection run failed in the last hour, so storage is not being reclaimed. Check the GC history in the UI (Administration > Clean Up) and the jobservice/registryctl logs.
+  - name: harbor.capacity
+    rules:
+    - alert: HarborProjectQuotaNearLimit
+      expr: |
+        (
+          harbor_project_quota_usage_byte / (harbor_project_quota_byte > 0)
+        ) > 0.85 < 1
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor project {{ $labels.project_name }} is close to its quota
+        description: Project {{ $labels.project_name }} has used {{ $value | humanizePercentage }} of its storage quota. Pushes will be rejected when it reaches 100%.
+    - alert: HarborProjectQuotaExceeded
+      expr: |
+        (
+          harbor_project_quota_usage_byte / (harbor_project_quota_byte > 0)
+        ) >= 1
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Harbor project {{ $labels.project_name }} has reached its quota
+        description: Project {{ $labels.project_name }} is at {{ $value | humanizePercentage }} of its storage quota. New pushes to this project will fail until space is freed or the quota is raised.
+    - alert: HarborProjectQuotaWillFillSoon
+      expr: |
+        predict_linear(harbor_project_quota_usage_byte[6h], 7 * 24 * 3600)
+          > (harbor_project_quota_byte > 0)
+        and
+        (
+          harbor_project_quota_usage_byte / (harbor_project_quota_byte > 0)
+        ) < 0.85
+      for: 1h
+      labels:
+        severity: info
+      annotations:
+        summary: Harbor project {{ $labels.project_name }} may fill its quota within 7 days
+        description: At the current growth rate project {{ $labels.project_name }} is predicted to exceed its storage quota within a week.
+  - name: harbor.process
+    rules:
+    - alert: HarborProcessFileDescriptorsHigh
+      expr: |
+        (
+          process_open_fds{job=~".*harbor.*"}
+          /
+          process_max_fds{job=~".*harbor.*"}
+        ) > 0.8
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor process {{ $labels.instance }} is running out of file descriptors
+        description: '{{ $labels.job }} / {{ $labels.instance }} is using {{ $value | humanizePercentage }} of its file descriptor limit. Raise the limit or look for a connection/file leak.'
+    - alert: HarborProcessRestarting
+      expr: changes(process_start_time_seconds{job=~".*harbor.*"}[30m]) >= 3
+      labels:
+        severity: warning
+      annotations:
+        summary: Harbor process {{ $labels.instance }} keeps restarting
+        description: '{{ $labels.job }} / {{ $labels.instance }} restarted {{ $value }} times in the last 30 minutes. Check its logs and resource limits (OOMKilled?).'
