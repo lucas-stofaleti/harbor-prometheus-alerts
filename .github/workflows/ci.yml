@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rules:
+    name: Lint, unit test and verify generated rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PROMETHEUS_VERSION: "3.14.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python3 -m pip install "pyyaml==6.0.2"
+
+      - name: Install promtool
+        run: |
+          archive="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${archive}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/${archive}" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          promtool --version
+          python3 --version
+
+      - name: Lint rules
+        run: make lint
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Verify generated PrometheusRule is up to date
+        run: make check-generated
