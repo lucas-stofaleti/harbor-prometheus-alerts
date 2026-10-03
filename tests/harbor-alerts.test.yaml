@@ -1,0 +1,407 @@
+# Unit tests for rules/harbor-alerts.yaml
+# Run with: promtool test rules tests/harbor-alerts.test.yaml   (or `make test`)
+#
+# promtool compares annotations exactly, so if you reword an annotation in the
+# rules file, update the matching expectation here.
+
+rule_files:
+  - ../rules/harbor-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # Availability
+  # ---------------------------------------------------------------------------
+  - name: metrics missing (exporter down or core API unreachable)
+    interval: 1m
+    input_series:
+      # Some unrelated series exists, but harbor_health never shows up.
+      - series: 'up{job="harbor-exporter", instance="exp:9090"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HarborMetricsMissing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: HarborMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Harbor health metrics are missing
+              description: >-
+                No harbor_health series has been received for 5 minutes. Either the
+                Harbor exporter is down / not scraped, or it cannot reach Harbor
+                core. Check the exporter and core pods/containers and the scrape config.
+
+  - name: harbor unhealthy
+    interval: 1m
+    input_series:
+      - series: 'harbor_health{job="harbor-exporter", instance="exp:9090"}'
+        values: '1 1 0x12'
+    alert_rule_test:
+      - eval_time: 5m # pending only
+        alertname: HarborUnhealthy
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: HarborUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: harbor-exporter
+              instance: exp:9090
+            exp_annotations:
+              summary: Harbor reports itself as unhealthy
+              description: >-
+                The Harbor health API has been reporting a non-healthy status for 5
+                minutes on exp:9090. Look at harbor_up{component=...} to find the failing component.
+
+  - name: component down, critical vs auxiliary split
+    interval: 1m
+    input_series:
+      - series: 'harbor_up{job="harbor-exporter", instance="exp:9090", component="core"}'
+        values: '0x20'
+      - series: 'harbor_up{job="harbor-exporter", instance="exp:9090", component="jobservice"}'
+        values: '0x20'
+      - series: 'harbor_up{job="harbor-exporter", instance="exp:9090", component="portal"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: HarborComponentDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: harbor-exporter
+              instance: exp:9090
+              component: core
+            exp_annotations:
+              summary: Harbor component core is down
+              description: >-
+                Harbor component core has been reported as not
+                healthy for 5 minutes. Image pushes and pulls are likely impacted.
+      - eval_time: 12m
+        alertname: HarborAuxiliaryComponentDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-exporter
+              instance: exp:9090
+              component: jobservice
+            exp_annotations:
+              summary: Harbor component jobservice is down
+              description: >-
+                Harbor component jobservice has been unhealthy for 10
+                minutes. Core registry functionality still works, but the features
+                that depend on this component are unavailable.
+
+  # ---------------------------------------------------------------------------
+  # Core
+  # ---------------------------------------------------------------------------
+  - name: core 5xx ratio, with traffic guard
+    interval: 1m
+    input_series:
+      # busy instance: 1 req/s OK + 0.17 req/s 5xx  => ~14% errors
+      - series: 'harbor_core_http_request_total{job="harbor-core", instance="c1:8001", method="GET", code="200", operation="ListProjects"}'
+        values: '0+60x40'
+      - series: 'harbor_core_http_request_total{job="harbor-core", instance="c1:8001", method="GET", code="500", operation="ListProjects"}'
+        values: '0+10x40'
+      # quiet instance: 100% errors but only 0.05 req/s => must NOT alert
+      - series: 'harbor_core_http_request_total{job="harbor-core-quiet", instance="c2:8001", method="GET", code="500", operation="ListProjects"}'
+        values: '0+3x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: HarborCoreHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: harbor-core
+            exp_annotations:
+              summary: Harbor core is returning many 5xx responses
+              description: >-
+                14.29% of Harbor core API requests
+                (harbor-core) have failed with a 5xx in the last 5 minutes.
+                Check core logs and database/redis connectivity.
+
+  - name: core slow requests
+    interval: 1m
+    input_series:
+      # 1 req/s, each taking 10s on average
+      - series: 'harbor_core_http_request_duration_seconds_sum{job="harbor-core", instance="c1:8001", method="GET", operation="ListRepositories"}'
+        values: '0+600x40'
+      - series: 'harbor_core_http_request_duration_seconds_count{job="harbor-core", instance="c1:8001", method="GET", operation="ListRepositories"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: HarborCoreSlowRequests
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-core
+              instance: c1:8001
+              method: GET
+              operation: ListRepositories
+            exp_annotations:
+              summary: Harbor core operation ListRepositories is slow
+              description: >-
+                GET ListRepositories on c1:8001
+                averages 10s per request over the last 5
+                minutes. Usually a slow database or an overloaded core.
+
+  # ---------------------------------------------------------------------------
+  # Registry
+  # ---------------------------------------------------------------------------
+  - name: registry 5xx ratio
+    interval: 1m
+    input_series:
+      - series: 'registry_http_requests_total{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET", code="200"}'
+        values: '0+60x40'
+      - series: 'registry_http_requests_total{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET", code="503"}'
+        values: '0+30x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: HarborRegistryHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: harbor-registry
+            exp_annotations:
+              summary: Harbor registry is returning many 5xx responses
+              description: >-
+                33.33% of registry requests
+                (harbor-registry) failed with a 5xx in the last 5 minutes. Pushes
+                and pulls are impacted. Check registry logs and the storage backend
+                (S3/GCS/Azure/filesystem).
+
+  - name: registry slow handlers ignore blob handlers
+    interval: 1m
+    input_series:
+      # manifest: every request lands in the (5s, 10s] bucket => p95 > 5s
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET", le="1"}'
+        values: '0x40'
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET", le="5"}'
+        values: '0x40'
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET", le="10"}'
+        values: '0+60x40'
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET", le="+Inf"}'
+        values: '0+60x40'
+      - series: 'registry_http_request_duration_seconds_count{job="harbor-registry", instance="r1:8001", handler="manifest", method="GET"}'
+        values: '0+60x40'
+      # blob: identical slowness, must be ignored
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="blob", method="GET", le="1"}'
+        values: '0x40'
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="blob", method="GET", le="5"}'
+        values: '0x40'
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="blob", method="GET", le="10"}'
+        values: '0+60x40'
+      - series: 'registry_http_request_duration_seconds_bucket{job="harbor-registry", instance="r1:8001", handler="blob", method="GET", le="+Inf"}'
+        values: '0+60x40'
+      - series: 'registry_http_request_duration_seconds_count{job="harbor-registry", instance="r1:8001", handler="blob", method="GET"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: HarborRegistrySlowRequests
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-registry
+              handler: manifest
+            exp_annotations:
+              summary: Harbor registry handler manifest is slow
+              description: >-
+                The 95th percentile latency of the registry "manifest"
+                handler is 9.75s over the last 5 minutes.
+
+  # ---------------------------------------------------------------------------
+  # Jobservice
+  # ---------------------------------------------------------------------------
+  - name: job queue latency
+    interval: 1m
+    input_series:
+      - series: 'harbor_task_queue_latency{job="harbor-exporter", instance="exp:9090", type="REPLICATION"}'
+        values: '700x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HarborJobQueueLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-exporter
+              instance: exp:9090
+              type: REPLICATION
+            exp_annotations:
+              summary: Harbor job queue REPLICATION is not draining
+              description: >-
+                The oldest queued REPLICATION job has been waiting
+                11m 40s. Check that jobservice is running
+                and has free workers.
+
+  - name: job failure ratio
+    interval: 1m
+    input_series:
+      - series: 'harbor_jobservice_task_total{job="harbor-jobservice", instance="js:8001", type="REPLICATION", status="fail"}'
+        values: '0+1x80'
+      - series: 'harbor_jobservice_task_total{job="harbor-jobservice", instance="js:8001", type="REPLICATION", status="success"}'
+        values: '0+2x80'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: HarborJobsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-jobservice
+              type: REPLICATION
+            exp_annotations:
+              summary: Harbor REPLICATION jobs are failing
+              description: >-
+                33.33% of REPLICATION jobs failed
+                in the last hour. Inspect the failed executions in the Harbor UI
+                and the jobservice logs.
+
+  - name: garbage collection failure, including the very first failure
+    interval: 1m
+    input_series:
+      # The `fail` series only appears at the first failure (t=10m) and starts
+      # at 1, which increase() alone cannot detect.
+      - series: 'harbor_jobservice_task_total{job="harbor-jobservice", instance="js:8001", type="GARBAGE_COLLECTION", status="fail"}'
+        values: '_x10 1x100'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HarborGarbageCollectionFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-jobservice
+              instance: js:8001
+              type: GARBAGE_COLLECTION
+              status: fail
+            exp_annotations:
+              summary: Harbor garbage collection failed
+              description: >-
+                At least one garbage collection run failed in the last hour, so
+                storage is not being reclaimed. Check the GC history in the UI
+                (Administration > Clean Up) and the jobservice/registryctl logs.
+      - eval_time: 90m # failure is old news, no new failures => resolved
+        alertname: HarborGarbageCollectionFailed
+        exp_alerts: []
+
+  - name: garbage collection failure on an already existing series
+    interval: 1m
+    input_series:
+      # series existed for a long time, a further failure happens at t=100m
+      - series: 'harbor_jobservice_task_total{job="harbor-jobservice", instance="js:8001", type="GARBAGE_COLLECTION", status="fail"}'
+        values: '1x100 2x30'
+    alert_rule_test:
+      - eval_time: 105m
+        alertname: HarborGarbageCollectionFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-jobservice
+              instance: js:8001
+              type: GARBAGE_COLLECTION
+              status: fail
+            exp_annotations:
+              summary: Harbor garbage collection failed
+              description: >-
+                At least one garbage collection run failed in the last hour, so
+                storage is not being reclaimed. Check the GC history in the UI
+                (Administration > Clean Up) and the jobservice/registryctl logs.
+
+  # ---------------------------------------------------------------------------
+  # Capacity
+  # ---------------------------------------------------------------------------
+  - name: project quotas (near limit, exceeded, unlimited ignored)
+    interval: 1m
+    input_series:
+      # a: 90% -> near limit
+      - series: 'harbor_project_quota_byte{job="harbor-exporter", instance="exp:9090", project_name="a"}'
+        values: '1000x30'
+      - series: 'harbor_project_quota_usage_byte{job="harbor-exporter", instance="exp:9090", project_name="a"}'
+        values: '900x30'
+      # b: unlimited quota (-1) with lots of data -> never alerts
+      - series: 'harbor_project_quota_byte{job="harbor-exporter", instance="exp:9090", project_name="b"}'
+        values: '-1x30'
+      - series: 'harbor_project_quota_usage_byte{job="harbor-exporter", instance="exp:9090", project_name="b"}'
+        values: '999999x30'
+      # c: 100% -> exceeded (and NOT reported as near limit)
+      - series: 'harbor_project_quota_byte{job="harbor-exporter", instance="exp:9090", project_name="c"}'
+        values: '1000x30'
+      - series: 'harbor_project_quota_usage_byte{job="harbor-exporter", instance="exp:9090", project_name="c"}'
+        values: '1000x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HarborProjectQuotaNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-exporter
+              instance: exp:9090
+              project_name: a
+            exp_annotations:
+              summary: Harbor project a is close to its quota
+              description: >-
+                Project a has used
+                90% of its storage quota. Pushes will
+                be rejected when it reaches 100%.
+      - eval_time: 20m
+        alertname: HarborProjectQuotaExceeded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: harbor-exporter
+              instance: exp:9090
+              project_name: c
+            exp_annotations:
+              summary: Harbor project c has reached its quota
+              description: >-
+                Project c is at 100%
+                of its storage quota. New pushes to this project will fail until
+                space is freed or the quota is raised.
+
+  - name: project quota predicted to fill
+    interval: 1m
+    input_series:
+      - series: 'harbor_project_quota_byte{job="harbor-exporter", instance="exp:9090", project_name="d"}'
+        values: '1000000x200'
+      # grows by 1000 bytes per minute => far beyond the quota within 7 days
+      - series: 'harbor_project_quota_usage_byte{job="harbor-exporter", instance="exp:9090", project_name="d"}'
+        values: '10000+1000x200'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: HarborProjectQuotaWillFillSoon
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              job: harbor-exporter
+              instance: exp:9090
+              project_name: d
+            exp_annotations:
+              summary: Harbor project d may fill its quota within 7 days
+              description: >-
+                At the current growth rate project d is
+                predicted to exceed its storage quota within a week.
+
+  # ---------------------------------------------------------------------------
+  # Process
+  # ---------------------------------------------------------------------------
+  - name: process restarting
+    interval: 1m
+    input_series:
+      # start time changes 3 times within 30 minutes
+      - series: 'process_start_time_seconds{job="harbor-core", instance="c1:8001"}'
+        values: '100 100 200 300 400 400x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HarborProcessRestarting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: harbor-core
+              instance: c1:8001
+            exp_annotations:
+              summary: Harbor process c1:8001 keeps restarting
+              description: >-
+                harbor-core / c1:8001 restarted
+                3 times in the last 30 minutes. Check its logs and
+                resource limits (OOMKilled?).
