@@ -1,19 +1,41 @@
 # Harbor Prometheus Alerts
 
-Ready-to-use [Prometheus](https://prometheus.io) alerting rules for [Harbor](https://goharbor.io), the CNCF container registry. Copy the whole file, copy a single alert, or use it as inspiration for your own rules.
+[![CI](https://github.com/lucas-stofaleti/harbor-prometheus-alerts/actions/workflows/ci.yml/badge.svg)](https://github.com/lucas-stofaleti/harbor-prometheus-alerts/actions/workflows/ci.yml)
 
-- 20 alerts across availability, core API, registry, jobservice, capacity and process health
-- Plain Prometheus rules file and a Prometheus Operator `PrometheusRule`
-- Unit-tested with `promtool`
-- Based on the [Harbor metrics documentation](https://goharbor.io/docs/latest/administration/metrics/).
+A small, tested set of [Prometheus](https://prometheus.io) alerting rules for [Harbor](https://goharbor.io), the CNCF container registry. Copy the whole file, copy a single alert, or use it as a starting point for your own rules.
 
-> Every threshold is a sensible starting point, not a universal truth. Tune them to your traffic and storage backend.
+This is a community project and is not part of the official Harbor project.
+
+- **7 alerts** that watch symptoms (is Harbor reachable, are requests failing, are pulls slow, is work stuck) instead of every internal counter.
+- A plain Prometheus rules file and a generated Prometheus Operator `PrometheusRule`.
+- Unit-tested with `promtool` in CI.
+- Metric and label names checked against Harbor 2.15 running in Kubernetes (the [harbor-helm](https://github.com/goharbor/harbor-helm) chart, scraped by kube-prometheus-stack).
+- Honest about what it cannot see. See [What is not covered](#what-is-not-covered).
+
+> Every threshold is a sensible starting point, not a universal truth. Tune them to your traffic.
 
 ## Quick start
 
 ### 1. Make sure Harbor metrics are scraped
 
-Enable metrics in `harbor.yml` or set `metrics.enabled: true` in the Helm chart, then scrape the `exporter`, `core`, `registry` and `jobservice` components. See the [official docs](https://goharbor.io/docs/latest/administration/metrics/#scraping-metrics-with-prometheus) for the scrape config and `ServiceMonitor`.
+With the Helm chart:
+
+```yaml
+# values.yaml for the harbor chart
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    additionalLabels:
+      release: kube-prometheus-stack   # must match your Prometheus ruleSelector
+```
+
+With docker-compose or a static scrape config, enable metrics in `harbor.yml` and follow the [official metrics docs](https://goharbor.io/docs/latest/administration/metrics/#scraping-metrics-with-prometheus).
+
+Two things the rules depend on:
+
+- **Scrape job names.** `HarborTargetDown` looks at `up{job=~".*harbor.*"}`. That matches the chart's ServiceMonitor (`job="harbor"`) and the job names in the Harbor docs (`harbor-core`, `harbor-registry`, ...). Change the matcher if yours differ.
+- **The `component` label.** The health alerts use the `component` label that the exporter puts on `harbor_up`. The chart's ServiceMonitor sets `honorLabels: true`, which keeps it. With `honor_labels: false`, Prometheus renames a label that clashes with a target label to `exported_component`, and the component alerts would silently match nothing. Check with `harbor_up` in the Prometheus UI.
 
 ### 2a. Plain Prometheus
 
@@ -40,51 +62,56 @@ kube-prometheus-stack only loads rules whose labels match its `ruleSelector` (by
 kubectl -n monitoring label prometheusrule harbor-alerts release=kube-prometheus-stack
 ```
 
+`kubernetes/prometheusrule.yaml` is generated from `rules/harbor-alerts.yaml`. Do not edit it by hand (see [Contributing](#contributing)).
+
 ## Alerts
 
-| Alert | Severity | Fires when |
-|---|---|---|
-| `HarborMetricsMissing` | critical | `harbor_health` is absent: exporter down, or it cannot reach Harbor core |
-| `HarborUnhealthy` | critical | Harbor health API reports unhealthy |
-| `HarborComponentDown` | critical | `core`, `database`, `redis` or `registry` is down |
-| `HarborAuxiliaryComponentDown` | warning | `jobservice`, `portal`, `registryctl` or `trivy` is down |
-| `HarborScrapeTargetDown` | warning | a Harbor scrape target has `up == 0` |
-| `HarborCoreHighErrorRate` | critical | more than 5% of core API requests return 5xx |
-| `HarborCoreSlowRequests` | warning | mean latency of an API operation above 5s |
-| `HarborCoreInflightRequestsHigh` | warning | more than 100 concurrent requests in core |
-| `HarborRegistryHighErrorRate` | critical | more than 5% of registry requests return 5xx |
-| `HarborRegistrySlowRequests` | warning | p95 latency of a non-blob registry handler above 5s |
-| `HarborRegistryStorageSlow` | warning | p95 latency of a storage driver action above 10s |
-| `HarborJobQueueLatencyHigh` | warning | oldest queued job of a type has waited more than 10 min |
-| `HarborJobQueueBacklog` | info | more than 1000 queued jobs of a type for 30 min |
-| `HarborJobsFailing` | warning | more than 25% of a job type failed in the last hour (min. 5 tasks) |
-| `HarborGarbageCollectionFailed` | warning | a garbage collection run failed in the last hour |
-| `HarborProjectQuotaNearLimit` | warning | project between 85% and 100% of its quota |
-| `HarborProjectQuotaExceeded` | critical | project reached 100% of its quota (pushes fail) |
-| `HarborProjectQuotaWillFillSoon` | info | linear prediction says the quota fills within 7 days |
-| `HarborProcessFileDescriptorsHigh` | warning | a Harbor process uses more than 80% of its file descriptors |
-| `HarborProcessRestarting` | warning | a Harbor process restarted 3+ times in 30 min |
+| Alert | Severity | For | Fires when |
+|---|---|---|---|
+| `HarborTargetDown` | critical | 5m | Every scrape target of a job/service is down. Also catches a dead exporter, which would silently disable the health, queue and quota alerts. |
+| `HarborComponentUnhealthy` | critical | 5m | Harbor's health check reports `core`, `database`, `redis` or `registry` as unhealthy. These are on the push/pull path. |
+| `HarborAuxiliaryComponentUnhealthy` | warning | 15m | Any other component (`jobservice`, `portal`, `registryctl`, `trivy`, or one added later) is unhealthy. Push and pull keep working, but a feature is degraded. |
+| `HarborErrorRateHigh` | critical | 10m | More than 5% of client requests served by core return 5xx. Core also proxies all `/v2` registry traffic, so this is the user-facing symptom. |
+| `HarborManifestLatencyHigh` | warning | 10m | The p90 of manifest GET/HEAD requests is above 2s on the slowest core replica. Every pull starts with these calls. |
+| `HarborJobQueueStalled` | warning | 15m | The oldest queued job of a type has waited over 30 minutes **and** the queue has not shrunk in 30 minutes. |
+| `HarborProjectQuotaNearlyFull` | warning | 15m | A project with a quota has used more than 90% of it. Projects without a quota are ignored. |
 
-## Customising
+**Severity.** `critical`: push/pull is failing or about to fail, page someone. `warning`: a feature is degraded or a limit is approaching, open a ticket or send a chat message.
 
-- **Job names.** Only `HarborScrapeTargetDown`, `HarborProcessFileDescriptorsHigh` and `HarborProcessRestarting` reference job names (`job=~".*harbor.*"`). Change that matcher if your jobs are named differently.
-- **Several Harbors in one Prometheus.** Add your identifying label (`cluster`, `namespace`, ...) to the `by (...)` and `on (...)` clauses.
-- **No Trivy?** Remove `trivy` from the regex in `HarborAuxiliaryComponentDown`.
-- **Alertmanager.** Route on `severity`. A useful inhibition so a total outage does not also page for every sub-alert:
+### Notes on specific alerts
 
-  ```yaml
-  inhibit_rules:
-    - source_matchers: ['alertname="HarborMetricsMissing"']
-      target_matchers: ['alertname=~"Harbor.*"']
-      equal: []
-  ```
+- **`HarborErrorRateHigh`** ignores the probe-style requests (`GetPing`, `GetHealth`, `GetSystemInfo`) so a stream of healthy checks cannot hide real failures on a quiet instance. The operation names are matched case-insensitively. It has no minimum-traffic guard on purpose, so a low-volume client that fails every request still alerts.
+- **`HarborManifestLatencyHigh`** uses manifests because they are small and their latency does not depend on image size, unlike blobs. Manifest `PUT` is excluded. The metric is a summary, which cannot be aggregated across replicas, so the alert uses the slowest one. On a very quiet instance a single slow request can hold the p90 up for the length of the summary window.
 
-## What is *not* covered
+### Design
 
-Harbor's own metrics say nothing about the resources it depends on. Pair these rules with:
+- **Few alerts, each on a symptom.** Fewer rules are easier to tune, trust and maintain.
+- **Replica-safe.** Rules aggregate with `without (instance, pod)`. Replicas collapse into one series, and labels such as `namespace`, `service` and your own `cluster` or tenant labels survive for Alertmanager routing and grouping.
+- **Every alert has a unit test**, and the tests include the edge cases that mattered in practice (see `tests/harbor-alerts.test.yaml`).
 
-- PostgreSQL: [postgres_exporter](https://github.com/prometheus-community/postgres_exporter)
-- Redis / Valkey: [redis_exporter](https://github.com/oliver006/redis_exporter)
-- Storage backend capacity (PVC, S3/Ceph): kubelet volume metrics, or your object store's metrics
-- TLS certificate expiry and external reachability: [blackbox_exporter](https://github.com/prometheus/blackbox_exporter) or cert-manager metrics
-- Pod OOMKills / CrashLoops: kube-state-metrics
+## What is not covered
+
+Metrics only tell part of the story. Know these limits before relying on the rules.
+
+- **Failed jobs are not covered.** Scans, garbage collection and replication failures have no alert. Job counters depend too much on how often each job runs to alert on reliably, and replication failures such as an expired credential may not appear in them at all. Use [Harbor's webhooks](https://goharbor.io/docs/latest/working-with-projects/project-configuration/configure-webhooks/) for these, or poll the Harbor API.
+- **Proxy-cache upstream failures mostly return 404, not 5xx.** In testing on Harbor 2.15, with the upstream returning 401, returning 500, or down: cached content kept being served, an uncached manifest returned **404**, and an uncached blob returned 401 or 500. So `HarborErrorRateHigh` stays silent for most of them. The health of each registry endpoint does not appear among the Harbor metrics we checked. Polling `GET /api/v2.0/registries`, which reports each endpoint's `status`, is the way to catch it.
+
+## Contributing
+
+Issues and pull requests are welcome. A new alert should:
+
+1. Alert on a **symptom** someone would act on.
+2. Be **checked against a real Harbor**. Say which version, and show that the metric and label names exist.
+3. Have a **unit test** that covers the firing case and at least one case where it must stay silent.
+4. Say what it **cannot** see.
+
+Tooling:
+
+```bash
+make lint                # promtool check rules
+make test                # promtool unit tests
+make prometheusrule      # regenerate kubernetes/prometheusrule.yaml from the rules
+make check-generated     # what CI runs: fails if the generated file is out of date
+```
+
+CI uses [promtool](https://prometheus.io/docs/prometheus/latest/command-line/promtool/) and PyYAML. After changing `rules/harbor-alerts.yaml`, run `make prometheusrule` and commit the result, and update the table in this README.
